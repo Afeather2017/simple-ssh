@@ -1,0 +1,7 @@
+[package]
+name = "simple-ssh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "process", "macros", "io-util", "io-std"] }
