@@ -1,18 +1,22 @@
-use std::env;
 use tokio::net::{ TcpListener, TcpStream };
-use tokio::io::{ AsyncReadExt, AsyncWriteExt };
+use tokio::net::tcp::{ ReadHalf, WriteHalf };
+use tokio::io::{ self, AsyncReadExt, AsyncBufReadExt, BufReader, AsyncWriteExt };
 use std::net::{ SocketAddr };
 use tokio::process::Command;
 use std::process::Stdio;
-#[cfg(target_os = "windows")]
-const SHELL: &str = "cmd.exe";
-#[cfg(not(target_os = "windows"))]
-const SHELL: &str = "bash";
-async fn handle_socket(mut stream: TcpStream, remote_addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut read_half, mut write_half) = stream.split();
-
-    println!("open {} for remote {}", &SHELL, remote_addr);
-    let mut process = match Command::new(SHELL)
+use clap::{Parser, ValueEnum};
+use strum::Display;
+use serde::{Deserialize, Serialize};
+use serde_json::{ json, to_vec };
+#[derive(Deserialize, Serialize, Debug)]
+struct CommandArgs {
+    close: Option<bool>,
+    args: Vec<String>,
+}
+async fn run_command(read_half: &mut BufReader<ReadHalf<'_>>, write_half: &mut WriteHalf<'_>, args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("handle command {:?}", args);
+    let mut process = match Command::new(&args[0])
+        .args(&args[1..])
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
@@ -97,17 +101,58 @@ async fn handle_socket(mut stream: TcpStream, remote_addr: &SocketAddr) -> Resul
         }
     }
 }
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let port: u16 = env::args()
-        .nth(1)
-        .and_then(|arg1| arg1.parse::<u16>().ok())
-        .unwrap_or(9999);
-    println!("use 0.0.0.0:{}", port);
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+
+async fn handle_socket(mut stream: TcpStream, remote_addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    println!("open for remote {}", remote_addr);
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        let cmd = serde_json::from_str::<CommandArgs>(&line)?;
+        println!("receive command {:?}", cmd);
+        if cmd.args.len() == 0 {
+            continue;
+        }
+        if let Err(e) = run_command(&mut reader, &mut write_half, cmd.args).await {
+            let _ = write_half.write((e.to_string() + "\n").as_bytes()).await?;
+        }
+        if cmd.close == Some(true) {
+            return Ok(());
+        }
+    }
+
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Display)]
+enum Mode {
+    Server,
+    Client,
+}
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value_t = 9999)]
+    port: u16,
+
+    #[arg(short, long, default_value_t = "0.0.0.0".to_string())]
+    addr: String,
+
+    #[arg(short, long, default_value_t = Mode::Client)]
+    mode: Mode,
+
+    #[arg(short, long, num_args(1..))]
+    command: Vec<String>,
+}
+async fn run_server(listen_addr: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    println!("use {}:{}", listen_addr, port);
+    let listener = TcpListener::bind(format!("{}:{}", listen_addr, port)).await?;
     loop {
         let (socket, addr) = listener.accept().await?;
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             match handle_socket(socket, &addr).await {
                 Ok(_) => {
                     println!("connection to {} done", addr);
@@ -117,5 +162,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
         });
+    }
+}
+async fn run_client(addr: String, port: u16, command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(format!("{}:{}", addr, port)).await?;
+    let (mut read_half, mut write_half) = stream.split();
+    let mut to_send = serde_json::to_vec(&CommandArgs {
+        close: Some(true),
+        args: command,
+    })?;
+    to_send.push(b'\n');
+    println!("send command");
+    write_half.write(&to_send).await?;
+    loop {
+        let mut stream_buf = [0;1024];
+        match read_half.read(&mut stream_buf).await {
+            Ok(0) => {
+                return Ok(());
+            },
+            Ok(n) => {
+                let _ = io::stdout().write(&stream_buf[..n]).await?;
+            },
+            Err(e) => {
+                return Err(Box::new(e));
+            }
+        }
+    }
+}
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    match args.mode {
+        Mode::Server => run_server(args.addr, args.port).await,
+        Mode::Client => run_client(args.addr, args.port, args.command).await,
     }
 }
